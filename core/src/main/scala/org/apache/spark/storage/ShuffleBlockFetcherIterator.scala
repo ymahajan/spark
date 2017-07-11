@@ -17,7 +17,7 @@
 
 package org.apache.spark.storage
 
-import java.io.{InputStream, IOException}
+import java.io.{File, InputStream, IOException}
 import java.nio.ByteBuffer
 import java.util.concurrent.LinkedBlockingQueue
 import javax.annotation.concurrent.GuardedBy
@@ -28,7 +28,7 @@ import scala.collection.mutable.{ArrayBuffer, HashSet, Queue}
 import org.apache.spark.{SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
-import org.apache.spark.network.shuffle.{BlockFetchingListener, ShuffleClient}
+import org.apache.spark.network.shuffle.{BlockFetchingListener, ShuffleClient, TempShuffleFileManager}
 import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.util.Utils
 import org.apache.spark.util.io.ChunkedByteBufferOutputStream
@@ -52,6 +52,7 @@ import org.apache.spark.util.io.ChunkedByteBufferOutputStream
  * @param streamWrapper A function to wrap the returned input stream.
  * @param maxBytesInFlight max size (in bytes) of remote blocks to fetch at any given point.
  * @param maxReqsInFlight max number of remote requests to fetch blocks at any given point.
+ * @param maxReqSizeShuffleToMem max size (in bytes) of a request that can be shuffled to memory.
  * @param detectCorrupt whether to detect any corruption in fetched blocks.
  */
 private[spark]
@@ -63,8 +64,9 @@ final class ShuffleBlockFetcherIterator(
     streamWrapper: (BlockId, InputStream) => InputStream,
     maxBytesInFlight: Long,
     maxReqsInFlight: Int,
+    maxReqSizeShuffleToMem: Long,
     detectCorrupt: Boolean)
-  extends Iterator[(BlockId, InputStream)] with Logging {
+  extends Iterator[(BlockId, InputStream)] with TempShuffleFileManager with Logging {
 
   import ShuffleBlockFetcherIterator._
 
@@ -129,6 +131,13 @@ final class ShuffleBlockFetcherIterator(
   @GuardedBy("this")
   private[this] var isZombie = false
 
+  /**
+   * A set to store the files used for shuffling remote huge blocks. Files in this set will be
+   * deleted when cleanup. This is a layer of defensiveness against disk file leaks.
+   */
+  @GuardedBy("this")
+  private[this] val shuffleFilesSet = mutable.HashSet[File]()
+
   initialize()
 
   // Decrements the buffer reference count.
@@ -139,6 +148,19 @@ final class ShuffleBlockFetcherIterator(
       currentResult.buf.release()
     }
     currentResult = null
+  }
+
+  override def createTempShuffleFile(): File = {
+    blockManager.diskBlockManager.createTempLocalBlock()._2
+  }
+
+  override def registerTempShuffleFileToClean(file: File): Boolean = synchronized {
+    if (isZombie) {
+      false
+    } else {
+      shuffleFilesSet += file
+      true
+    }
   }
 
   /**
@@ -157,10 +179,18 @@ final class ShuffleBlockFetcherIterator(
         case SuccessFetchResult(_, address, _, buf, _) =>
           if (address != blockManager.blockManagerId) {
             shuffleMetrics.incRemoteBytesRead(buf.size)
+            if (buf.isInstanceOf[FileSegmentManagedBuffer]) {
+              shuffleMetrics.incRemoteBytesReadToDisk(buf.size)
+            }
             shuffleMetrics.incRemoteBlocksFetched(1)
           }
           buf.release()
         case _ =>
+      }
+    }
+    shuffleFilesSet.foreach { file =>
+      if (!file.delete()) {
+        logWarning("Failed to cleanup shuffle fetch temp file " + file.getAbsolutePath())
       }
     }
   }
@@ -175,33 +205,42 @@ final class ShuffleBlockFetcherIterator(
     val sizeMap = req.blocks.map { case (blockId, size) => (blockId.toString, size) }.toMap
     val remainingBlocks = new HashSet[String]() ++= sizeMap.keys
     val blockIds = req.blocks.map(_._1.toString)
-
     val address = req.address
-    shuffleClient.fetchBlocks(address.host, address.port, address.executorId, blockIds.toArray,
-      new BlockFetchingListener {
-        override def onBlockFetchSuccess(blockId: String, buf: ManagedBuffer): Unit = {
-          // Only add the buffer to results queue if the iterator is not zombie,
-          // i.e. cleanup() has not been called yet.
-          ShuffleBlockFetcherIterator.this.synchronized {
-            if (!isZombie) {
-              // Increment the ref count because we need to pass this to a different thread.
-              // This needs to be released after use.
-              buf.retain()
-              remainingBlocks -= blockId
-              results.put(new SuccessFetchResult(BlockId(blockId), address, sizeMap(blockId), buf,
-                remainingBlocks.isEmpty))
-              logDebug("remainingBlocks: " + remainingBlocks)
-            }
-          }
-          logTrace("Got remote block " + blockId + " after " + Utils.getUsedTimeMs(startTime))
-        }
 
-        override def onBlockFetchFailure(blockId: String, e: Throwable): Unit = {
-          logError(s"Failed to get block(s) from ${req.address.host}:${req.address.port}", e)
-          results.put(new FailureFetchResult(BlockId(blockId), address, e))
+    val blockFetchingListener = new BlockFetchingListener {
+      override def onBlockFetchSuccess(blockId: String, buf: ManagedBuffer): Unit = {
+        // Only add the buffer to results queue if the iterator is not zombie,
+        // i.e. cleanup() has not been called yet.
+        ShuffleBlockFetcherIterator.this.synchronized {
+          if (!isZombie) {
+            // Increment the ref count because we need to pass this to a different thread.
+            // This needs to be released after use.
+            buf.retain()
+            remainingBlocks -= blockId
+            results.put(new SuccessFetchResult(BlockId(blockId), address, sizeMap(blockId), buf,
+              remainingBlocks.isEmpty))
+            logDebug("remainingBlocks: " + remainingBlocks)
+          }
         }
+        logTrace("Got remote block " + blockId + " after " + Utils.getUsedTimeMs(startTime))
       }
-    )
+
+      override def onBlockFetchFailure(blockId: String, e: Throwable): Unit = {
+        logError(s"Failed to get block(s) from ${req.address.host}:${req.address.port}", e)
+        results.put(new FailureFetchResult(BlockId(blockId), address, e))
+      }
+    }
+
+    // Fetch remote shuffle blocks to disk when the request is too large. Since the shuffle data is
+    // already encrypted and compressed over the wire(w.r.t. the related configs), we can just fetch
+    // the data and write it to file directly.
+    if (req.size > maxReqSizeShuffleToMem) {
+      shuffleClient.fetchBlocks(address.host, address.port, address.executorId, blockIds.toArray,
+        blockFetchingListener, this)
+    } else {
+      shuffleClient.fetchBlocks(address.host, address.port, address.executorId, blockIds.toArray,
+        blockFetchingListener, null)
+    }
   }
 
   private[this] def splitLocalRemoteBlocks(): ArrayBuffer[FetchRequest] = {
@@ -337,6 +376,9 @@ final class ShuffleBlockFetcherIterator(
         case r @ SuccessFetchResult(blockId, address, size, buf, isNetworkReqDone) =>
           if (address != blockManager.blockManagerId) {
             shuffleMetrics.incRemoteBytesRead(buf.size)
+            if (buf.isInstanceOf[FileSegmentManagedBuffer]) {
+              shuffleMetrics.incRemoteBytesReadToDisk(buf.size)
+            }
             shuffleMetrics.incRemoteBlocksFetched(1)
           }
           bytesInFlight -= size
